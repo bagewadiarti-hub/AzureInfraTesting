@@ -133,7 +133,8 @@ pipeline {
                 "Standard_B2s",
                 "Standard_DS1_v2",
                 "Standard_D2s_v5",
-                "Standard_B2ms"
+                "Standard_B2ms",
+                "Standard_D4s_v5"
             ]
 
             def vmCreated = false
@@ -142,7 +143,9 @@ pipeline {
 
                 if (vmCreated) break
 
+                echo "------------------------------------"
                 echo "Trying VM size: ${size}"
+                echo "------------------------------------"
 
                 try {
 
@@ -164,16 +167,16 @@ pipeline {
                         """
                     }
 
-                    echo "VM successfully created with size ${size}"
+                    echo "SUCCESS → VM created using ${size}"
                     vmCreated = true
 
                 } catch (err) {
-                    echo "VM size ${size} not available. Trying next..."
+                    echo "FAILED → ${size} not available"
                 }
             }
 
             if (!vmCreated) {
-                error("All VM sizes unavailable in this region. Deployment failed.")
+                error("No VM sizes available in this region. Try another region.")
             }
         }
     }
