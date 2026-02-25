@@ -126,27 +126,58 @@ pipeline {
         }
 
         stage('Create Windows VM') {
-            steps {
-                retry(2) {
+    steps {
+        script {
+
+            def vmSizes = [
+                "Standard_B2s",
+                "Standard_DS1_v2",
+                "Standard_D2s_v5",
+                "Standard_B2ms"
+            ]
+
+            def vmCreated = false
+
+            for (size in vmSizes) {
+
+                if (vmCreated) break
+
+                echo "Trying VM size: ${size}"
+
+                try {
+
                     withCredentials([
                         string(credentialsId: 'azure-vm-admin-password', variable: 'ADMIN_PASS')
                     ]) {
+
                         bat """
                         az vm create ^
-                          --resource-group ${env.RESOURCE_GROUP} ^
+                          --resource-group rg-${params.ENVIRONMENT} ^
                           --name ${env.VM_NAME} ^
                           --image Win2019Datacenter ^
-                          --admin-username ${env.VM_ADMIN_USER} ^
+                          --admin-username azureuser ^
                           --admin-password "%ADMIN_PASS%" ^
-                          --size Standard_B2s ^
+                          --size ${size} ^
                           --location ${params.AZURE_REGION} ^
                           --public-ip-sku Standard ^
                           --tags environment=${params.ENVIRONMENT}
                         """
                     }
+
+                    echo "VM successfully created with size ${size}"
+                    vmCreated = true
+
+                } catch (err) {
+                    echo "VM size ${size} not available. Trying next..."
                 }
             }
+
+            if (!vmCreated) {
+                error("All VM sizes unavailable in this region. Deployment failed.")
+            }
         }
+    }
+}
 
         stage('Open RDP Port') {
             steps {
