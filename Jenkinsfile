@@ -1,13 +1,10 @@
 pipeline {
     agent any
 
-    ///////////////////////////////////////////////////////
-    // PIPELINE OPTIONS
-    ///////////////////////////////////////////////////////
     options {
         timestamps()
         timeout(time: 90, unit: 'MINUTES')
-        buildDiscarder(logRotator(numToKeepStr: '25'))
+        buildDiscarder(logRotator(numToKeepStr: '20'))
     }
 
     ///////////////////////////////////////////////////////
@@ -24,7 +21,7 @@ pipeline {
         string(
             name: 'GIT_BRANCH',
             defaultValue: 'main',
-            description: 'Git branch / release version'
+            description: 'Git branch / release'
         )
 
         choice(
@@ -34,21 +31,15 @@ pipeline {
         )
 
         string(
-            name: 'VM_BASE_NAME',
+            name: 'VM_NAME',
             defaultValue: 'jenkins-win-vm',
-            description: 'Base name for Windows VM'
+            description: 'Base VM name'
         )
 
         string(
-            name: 'VM_SIZE',
-            defaultValue: 'Standard_B2s',
-            description: 'Azure VM size'
-        )
-
-        booleanParam(
-            name: 'AUTO_DESTROY',
-            defaultValue: false,
-            description: 'Delete resource group after build (recommended for DEV/TEST)'
+            name: 'STORAGE_PREFIX',
+            defaultValue: 'jenkinsstorage',
+            description: 'Storage account prefix (lowercase only)'
         )
     }
 
@@ -57,8 +48,8 @@ pipeline {
     ///////////////////////////////////////////////////////
     environment {
         RESOURCE_GROUP = "rg-${params.ENVIRONMENT}"
+        VM_SIZE = "Standard_B2s"
         ADMIN_USER = "azureuser"
-        BUILD_TAG_SAFE = "${env.BUILD_NUMBER}"
     }
 
     ///////////////////////////////////////////////////////
@@ -67,18 +58,26 @@ pipeline {
     stages {
 
         ///////////////////////////////////////////////////
-        // VALIDATION
+        // VALIDATE INPUTS
         ///////////////////////////////////////////////////
         stage('Validate Inputs') {
             steps {
                 script {
                     echo "Environment = ${params.ENVIRONMENT}"
                     echo "Region = ${params.AZURE_REGION}"
-
-                    if (params.ENVIRONMENT == 'prod') {
-                        input message: "CONFIRM production infrastructure deployment"
-                    }
                 }
+            }
+        }
+
+        ///////////////////////////////////////////////////
+        // PRODUCTION APPROVAL
+        ///////////////////////////////////////////////////
+        stage('Production Approval') {
+            when {
+                expression { params.ENVIRONMENT == 'prod' }
+            }
+            steps {
+                input message: "Approve PRODUCTION infrastructure deployment?"
             }
         }
 
@@ -91,9 +90,9 @@ pipeline {
                     string(credentialsId: 'azure-client-id', variable: 'AZ_CLIENT'),
                     string(credentialsId: 'azure-client-secret', variable: 'AZ_SECRET'),
                     string(credentialsId: 'azure-tenant-id', variable: 'AZ_TENANT'),
-                    string(credentialsId: 'azure-subscription-id', variable: 'AZ_SUB')
+                    string(credentialsId: 'azure-subscription-id', variable: 'AZ_SUB'),
+                    string(credentialsId: 'azure-vm-admin-password', variable: 'ADMIN_PASS')
                 ]) {
-
                     bat """
                     az login --service-principal ^
                         --username %AZ_CLIENT% ^
@@ -101,23 +100,49 @@ pipeline {
                         --tenant %AZ_TENANT%
 
                     az account set --subscription %AZ_SUB%
-                    az account show
                     """
                 }
             }
         }
 
         ///////////////////////////////////////////////////
-        // CREATE RESOURCE GROUP
+        // CREATE OR VALIDATE RESOURCE GROUP
         ///////////////////////////////////////////////////
-        stage('Create Resource Group') {
+        stage('Create or Validate Resource Group') {
             steps {
-                bat """
-                az group create ^
-                  --name %RESOURCE_GROUP% ^
-                  --location ${params.AZURE_REGION} ^
-                  --tags environment=${params.ENVIRONMENT} owner=jenkins
-                """
+                script {
+
+                    def exists = bat(
+                        script: "az group exists --name ${env.RESOURCE_GROUP}",
+                        returnStdout: true
+                    ).trim()
+
+                    if (exists == "true") {
+
+                        echo "Resource group exists. Checking location..."
+
+                        def existingLocation = bat(
+                            script: "az group show --name ${env.RESOURCE_GROUP} --query location -o tsv",
+                            returnStdout: true
+                        ).trim()
+
+                        echo "Using existing location: ${existingLocation}"
+                        env.ACTUAL_REGION = existingLocation
+
+                    } else {
+
+                        echo "Creating resource group in ${params.AZURE_REGION}"
+
+                        bat """
+                        az group create ^
+                          --name ${env.RESOURCE_GROUP} ^
+                          --location ${params.AZURE_REGION} ^
+                          --tags environment=${params.ENVIRONMENT} owner=jenkins
+                        """
+
+                        env.ACTUAL_REGION = params.AZURE_REGION
+                    }
+                }
             }
         }
 
@@ -127,13 +152,13 @@ pipeline {
         stage('Generate Unique Names') {
             steps {
                 script {
-                    def unique = new Date().format("HHmmss")
+                    def rand = UUID.randomUUID().toString().replaceAll("-", "").substring(0,8)
 
-                    env.STORAGE_NAME = "st${params.ENVIRONMENT}${unique}".toLowerCase()
-                    env.VM_NAME = "${params.VM_BASE_NAME}-${params.ENVIRONMENT}-${unique}".toLowerCase()
+                    env.STORAGE_ACCOUNT = "${params.STORAGE_PREFIX}${rand}".toLowerCase()
+                    env.FINAL_VM_NAME = "${params.VM_NAME}-${env.BUILD_NUMBER}"
 
-                    echo "Storage Account = ${env.STORAGE_NAME}"
-                    echo "VM Name = ${env.VM_NAME}"
+                    echo "Storage account = ${env.STORAGE_ACCOUNT}"
+                    echo "VM name = ${env.FINAL_VM_NAME}"
                 }
             }
         }
@@ -146,12 +171,11 @@ pipeline {
                 retry(2) {
                     bat """
                     az storage account create ^
-                      --name %STORAGE_NAME% ^
-                      --resource-group %RESOURCE_GROUP% ^
-                      --location ${params.AZURE_REGION} ^
+                      --name ${env.STORAGE_ACCOUNT} ^
+                      --resource-group ${env.RESOURCE_GROUP} ^
+                      --location ${env.ACTUAL_REGION} ^
                       --sku Standard_LRS ^
-                      --min-tls-version TLS1_2 ^
-                      --allow-blob-public-access false
+                      --min-tls-version TLS1_2
                     """
                 }
             }
@@ -162,23 +186,19 @@ pipeline {
         ///////////////////////////////////////////////////
         stage('Create Windows VM') {
             steps {
-                withCredentials([
-                    string(credentialsId: 'azure-vm-admin-password', variable: 'ADMIN_PASS')
-                ]) {
-
-                    retry(2) {
-                        bat """
-                        az vm create ^
-                          --resource-group %RESOURCE_GROUP% ^
-                          --name %VM_NAME% ^
-                          --image Win2019Datacenter ^
-                          --admin-username %ADMIN_USER% ^
-                          --admin-password %ADMIN_PASS% ^
-                          --size ${params.VM_SIZE} ^
-                          --public-ip-sku Standard ^
-                          --tags environment=${params.ENVIRONMENT} deployedBy=jenkins
-                        """
-                    }
+                retry(2) {
+                    bat """
+                    az vm create ^
+                      --resource-group ${env.RESOURCE_GROUP} ^
+                      --name ${env.FINAL_VM_NAME} ^
+                      --image Win2019Datacenter ^
+                      --admin-username ${env.ADMIN_USER} ^
+                      --admin-password %ADMIN_PASS% ^
+                      --size ${env.VM_SIZE} ^
+                      --location ${env.ACTUAL_REGION} ^
+                      --public-ip-sku Standard ^
+                      --tags environment=${params.ENVIRONMENT}
+                    """
                 }
             }
         }
@@ -190,8 +210,8 @@ pipeline {
             steps {
                 bat """
                 az vm open-port ^
-                  --resource-group %RESOURCE_GROUP% ^
-                  --name %VM_NAME% ^
+                  --resource-group ${env.RESOURCE_GROUP} ^
+                  --name ${env.FINAL_VM_NAME} ^
                   --port 3389
                 """
             }
@@ -204,42 +224,39 @@ pipeline {
             steps {
                 bat """
                 az vm show ^
-                  --resource-group %RESOURCE_GROUP% ^
-                  --name %VM_NAME% ^
+                  --resource-group ${env.RESOURCE_GROUP} ^
+                  --name ${env.FINAL_VM_NAME} ^
                   -d ^
                   --query publicIps ^
                   -o table
                 """
             }
         }
+
+        ///////////////////////////////////////////////////
+        // AUTO CLEANUP NON PROD
+        ///////////////////////////////////////////////////
+        stage('Auto Cleanup (Non-Prod)') {
+            when {
+                expression { params.ENVIRONMENT != 'prod' }
+            }
+            steps {
+                echo "Non-production environment — keeping resources for testing"
+            }
+        }
     }
 
     ///////////////////////////////////////////////////////
-    // POST ACTIONS
+    // POST
     ///////////////////////////////////////////////////////
     post {
         success {
-            echo "Infrastructure deployment completed successfully"
+            echo "Infrastructure deployed successfully"
         }
-
         failure {
             echo "Infrastructure deployment failed"
         }
-
         always {
-            script {
-                if (params.AUTO_DESTROY && params.ENVIRONMENT != 'prod') {
-                    echo "Auto-destroy enabled — deleting resource group"
-
-                    bat """
-                    az group delete ^
-                      --name %RESOURCE_GROUP% ^
-                      --yes ^
-                      --no-wait
-                    """
-                }
-            }
-
             bat "az logout"
         }
     }
