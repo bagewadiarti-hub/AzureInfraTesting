@@ -7,26 +7,23 @@ pipeline {
     }
 
     environment {
-        APP_NAME = "azure-infra-app"
+        APP_NAME = "sample-app"
         RESOURCE_GROUP = "rg-dev"
-        LOCATION = "westeurope"
-        STORAGE_NAME_PREFIX = "corpdevst"
-        VM_NAME_PREFIX = "winvm"
-        VM_SIZE_LIST = "Standard_B2s,Standard_B1ms,Standard_D2s_v5"
+        STORAGE_PREFIX = "corpdevst"
+        VM_PREFIX = "winvm"
         VM_ADMIN_USER = "azureuser"
+
+        // Fallback VM sizes
+        VM_SIZES = "Standard_D2a_v4,Standard_D2as_v4,Standard_E2as_v4,Standard_D2ads_v5"
+        // Fallback regions
+        AZURE_REGIONS = "eastus,westeurope,uksouth,northeurope,northcentralus,francecentral"
     }
 
     stages {
+
         stage('Checkout SCM') {
             steps {
-                checkout([
-                    $class: 'GitSCM',
-                    branches: [[name: '*/main']],
-                    userRemoteConfigs: [[
-                        url: 'https://github.com/bagewadiarti-hub/AzureInfraTesting.git',
-                        credentialsId: 'github-creds'
-                    ]]
-                ])
+                checkout scm
             }
         }
 
@@ -54,7 +51,7 @@ pipeline {
                 bat """
                 az group create ^
                   --name ${RESOURCE_GROUP} ^
-                  --location ${LOCATION}
+                  --location westeurope
                 """
             }
         }
@@ -62,8 +59,9 @@ pipeline {
         stage('Generate Names') {
             steps {
                 script {
-                    STORAGE_NAME = "${STORAGE_NAME_PREFIX}${UUID.randomUUID().toString().replaceAll('-', '').take(10)}"
-                    VM_NAME = "${VM_NAME_PREFIX}${UUID.randomUUID().toString().replaceAll('-', '').take(6)}"
+                    def timestamp = System.currentTimeMillis().toString().takeRight(8)
+                    STORAGE_NAME = "${STORAGE_PREFIX}${timestamp}"
+                    VM_NAME = "${VM_PREFIX}${timestamp}"
                     echo "Storage → ${STORAGE_NAME}"
                     echo "VM → ${VM_NAME}"
                 }
@@ -76,7 +74,7 @@ pipeline {
                 az storage account create ^
                   --name ${STORAGE_NAME} ^
                   --resource-group ${RESOURCE_GROUP} ^
-                  --location ${LOCATION} ^
+                  --location westeurope ^
                   --sku Standard_LRS ^
                   --https-only true
                 """
@@ -87,28 +85,36 @@ pipeline {
             steps {
                 withCredentials([string(credentialsId: 'azure-vm-admin-password', variable: 'ADMIN_PASS')]) {
                     script {
-                        def vmSizes = VM_SIZE_LIST.split(',')
-                        def created = false
-                        for (size in vmSizes) {
-                            try {
-                                bat """
-                                az vm create ^
-                                  --resource-group ${RESOURCE_GROUP} ^
-                                  --name ${VM_NAME} ^
-                                  --image Win2019Datacenter ^
-                                  --size ${size} ^
-                                  --admin-username ${VM_ADMIN_USER} ^
-                                  --admin-password ${ADMIN_PASS}
-                                """
-                                echo "VM created with size ${size}"
-                                created = true
-                                break
-                            } catch (err) {
-                                echo "VM creation failed for size ${size}, trying next..."
+                        def vmCreated = false
+                        def sizes = VM_SIZES.split(',')
+                        def regions = AZURE_REGIONS.split(',')
+
+                        outer:
+                        for (region in regions) {
+                            for (size in sizes) {
+                                try {
+                                    echo "Trying to create VM: ${VM_NAME} in region ${region} with size ${size}"
+                                    bat """
+                                    az vm create ^
+                                      --resource-group ${RESOURCE_GROUP} ^
+                                      --name ${VM_NAME} ^
+                                      --image Win2019Datacenter ^
+                                      --size ${size} ^
+                                      --location ${region} ^
+                                      --admin-username ${VM_ADMIN_USER} ^
+                                      --admin-password %ADMIN_PASS%
+                                    """
+                                    echo "VM created successfully in ${region} with size ${size}"
+                                    vmCreated = true
+                                    break outer
+                                } catch (err) {
+                                    echo "Failed size ${size} in ${region}, trying next..."
+                                }
                             }
                         }
-                        if (!created) {
-                            error "All VM sizes failed. Cannot create VM."
+
+                        if (!vmCreated) {
+                            error "All VM sizes and regions failed. Cannot create VM."
                         }
                     }
                 }
@@ -129,26 +135,26 @@ pipeline {
         stage('Get Public IP') {
             steps {
                 script {
-                    def publicIP = bat(
-                        script: "az vm list-ip-addresses --name ${VM_NAME} --resource-group ${RESOURCE_GROUP} --query '[0].virtualMachine.network.publicIpAddresses[0].ipAddress' -o tsv",
-                        returnStdout: true
-                    ).trim()
-                    echo "Public IP → ${publicIP}"
+                    def ip = bat(script: "az vm list-ip-addresses --name ${VM_NAME} --resource-group ${RESOURCE_GROUP} --query [0].virtualMachine.network.publicIpAddresses[0].ipAddress -o tsv", returnStdout: true).trim()
+                    echo "VM Public IP → ${ip}"
                 }
             }
         }
-    }
+
+    } // stages
 
     post {
         always {
             echo "Logging out from Azure"
-            bat 'az logout || exit 0'
+            bat "az logout || exit 0"
         }
+
         failure {
             echo "Deployment failed!"
         }
+
         success {
-            echo "Deployment succeeded!"
+            echo "Deployment completed successfully!"
         }
     }
 }
