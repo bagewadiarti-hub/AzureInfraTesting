@@ -4,64 +4,27 @@ pipeline {
     options {
         timestamps()
         timeout(time: 90, unit: 'MINUTES')
-        buildDiscarder(logRotator(numToKeepStr: '20'))
     }
 
-///////////////////////////////////////////////////////////
-// PARAMETERS
-///////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////
 parameters {
-
-    choice(
-        name: 'ENVIRONMENT',
-        choices: ['dev', 'test', 'prod'],
-        description: 'Deployment environment'
-    )
-
-    string(
-        name: 'GIT_BRANCH',
-        defaultValue: 'main',
-        description: 'Git branch / release'
-    )
-
-    choice(
-        name: 'PRIMARY_REGION',
-        choices: ['westeurope', 'centralindia', 'eastus', 'westus2'],
-        description: 'Preferred Azure region'
-    )
-
-    string(
-        name: 'VM_NAME',
-        defaultValue: 'winvm',
-        description: 'Base VM name'
-    )
+    choice(name: 'ENVIRONMENT', choices: ['dev','test','prod'])
+    choice(name: 'PRIMARY_REGION', choices: ['westeurope','centralindia','eastus','westus2'])
+    string(name: 'VM_NAME', defaultValue: 'winvm')
 }
 
-///////////////////////////////////////////////////////////
-// ENVIRONMENT
-///////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////
 environment {
     COMPANY_PREFIX = "corp"
     RESOURCE_GROUP = "rg-${params.ENVIRONMENT}"
     VM_SIZE = "Standard_B2s"
     ADMIN_USER = "azureuser"
-    ADMIN_PASS = credentials('vm-admin-password')   // Jenkins secret
+    ADMIN_PASS = credentials('azure-vm-admin-password')
 }
 
-///////////////////////////////////////////////////////////
-// STAGES
-///////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////
 stages {
 
-///////////////////////////////////////////////////////////
-stage('Validate Inputs') {
-    steps {
-        echo "Environment = ${params.ENVIRONMENT}"
-        echo "Primary region = ${params.PRIMARY_REGION}"
-    }
-}
-
-///////////////////////////////////////////////////////////
 stage('Azure Login') {
     steps {
         withCredentials([
@@ -82,114 +45,45 @@ stage('Azure Login') {
     }
 }
 
-///////////////////////////////////////////////////////////
-stage('Select Best Azure Region') {
-    steps {
-        script {
-
-            def regionPriority = [
-                params.PRIMARY_REGION,
-                "centralindia",
-                "eastus",
-                "westus2"
-            ].unique()
-
-            env.SELECTED_REGION = regionPriority[0]
-            echo "Selected Azure region → ${env.SELECTED_REGION}"
-        }
-    }
-}
-
-///////////////////////////////////////////////////////////
-stage('Production Approval') {
-    when { expression { params.ENVIRONMENT == 'prod' } }
-    steps {
-        input message: "Approve PRODUCTION deployment?", ok: "Deploy"
-    }
-}
-
-///////////////////////////////////////////////////////////
 stage('Create Resource Group') {
     steps {
         bat """
         az group create ^
           --name %RESOURCE_GROUP% ^
-          --location %SELECTED_REGION% ^
-          --tags environment=${params.ENVIRONMENT} owner=jenkins
+          --location ${params.PRIMARY_REGION}
         """
     }
 }
 
-///////////////////////////////////////////////////////////
-stage('Generate Enterprise Resource Names') {
+stage('Generate Names') {
     steps {
         script {
+            def suffix = powershell(
+              script: "[guid]::NewGuid().ToString('N').Substring(0,10)",
+              returnStdout: true
+            ).trim().toLowerCase()
 
-            def maxRetries = 20
-            def found = false
+            env.STORAGE_ACCOUNT_NAME = "corp${params.ENVIRONMENT}st${suffix}"
+            env.FINAL_VM_NAME = "${params.VM_NAME}-${suffix.substring(0,5)}"
 
-            for (int i = 0; i < maxRetries; i++) {
-
-                def suffix = powershell(
-                    script: "[guid]::NewGuid().ToString('N').Substring(0,10).ToLower()",
-                    returnStdout: true
-                ).trim()
-
-                def storageName = "${COMPANY_PREFIX}${params.ENVIRONMENT}st${suffix}".toLowerCase()
-
-                if (storageName.length() > 24) continue
-
-                def available = bat(
-                    script: """
-                    az storage account check-name ^
-                      --name ${storageName} ^
-                      --query nameAvailable ^
-                      -o tsv
-                    """,
-                    returnStdout: true
-                ).trim()
-
-                if (available == "true") {
-                    env.STORAGE_ACCOUNT_NAME = storageName
-                    echo "Storage account selected → ${storageName}"
-                    found = true
-                    break
-                } else {
-                    echo "Name not available → retrying"
-                }
-            }
-
-            if (!found) {
-                error "Unable to generate unique storage account name"
-            }
-
-            def vmSuffix = powershell(
-                script: "[guid]::NewGuid().ToString('N').Substring(0,5).ToLower()",
-                returnStdout: true
-            ).trim()
-
-            env.FINAL_VM_NAME = "${params.VM_NAME}-${vmSuffix}"
-            echo "VM name → ${env.FINAL_VM_NAME}"
+            echo "Storage → ${env.STORAGE_ACCOUNT_NAME}"
+            echo "VM → ${env.FINAL_VM_NAME}"
         }
     }
 }
 
-///////////////////////////////////////////////////////////
-stage('Create Storage Account') {
+stage('Create Storage') {
     steps {
         bat """
         az storage account create ^
           --name %STORAGE_ACCOUNT_NAME% ^
           --resource-group %RESOURCE_GROUP% ^
-          --location %SELECTED_REGION% ^
-          --sku Standard_LRS ^
-          --https-only true ^
-          --min-tls-version TLS1_2
+          --location ${params.PRIMARY_REGION} ^
+          --sku Standard_LRS
         """
     }
 }
 
-///////////////////////////////////////////////////////////
 stage('Create Windows VM') {
     steps {
         bat """
@@ -199,14 +93,12 @@ stage('Create Windows VM') {
           --image Win2019Datacenter ^
           --admin-username %ADMIN_USER% ^
           --admin-password %ADMIN_PASS% ^
-          --size %VM_SIZE% ^
-          --public-ip-sku Standard
+          --size %VM_SIZE%
         """
     }
 }
 
-///////////////////////////////////////////////////////////
-stage('Open RDP Port') {
+stage('Open RDP') {
     steps {
         bat """
         az vm open-port ^
@@ -217,8 +109,7 @@ stage('Open RDP Port') {
     }
 }
 
-///////////////////////////////////////////////////////////
-stage('Get VM Public IP') {
+stage('Get Public IP') {
     steps {
         bat """
         az vm show ^
@@ -233,12 +124,18 @@ stage('Get VM Public IP') {
 
 }
 
-///////////////////////////////////////////////////////////
-// POST
-///////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////
 post {
+
     always {
-        bat "az logout || exit 0"
+        script {
+            if (env.WORKSPACE) {
+                echo "Logging out from Azure"
+                bat "az logout || exit 0"
+            } else {
+                echo "Workspace not available — skipping logout"
+            }
+        }
     }
 
     success {
