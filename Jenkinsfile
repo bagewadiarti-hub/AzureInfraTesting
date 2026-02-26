@@ -86,14 +86,15 @@ pipeline {
                 withCredentials([string(credentialsId: 'azure-vm-admin-password', variable: 'ADMIN_PASS')]) {
                     script {
                         def vmCreated = false
-                        def sizes = VM_SIZES.split(',')
-                        def regions = AZURE_REGIONS.split(',')
+                        def sizes = VM_SIZES.tokenize(',')
+                        def regions = AZURE_REGIONS.tokenize(',')
 
-                        outer:
                         for (region in regions) {
+                            if (vmCreated) { break }
                             for (size in sizes) {
+                                if (vmCreated) { break }
                                 try {
-                                    echo "Trying to create VM: ${VM_NAME} in region ${region} with size ${size}"
+                                    echo "Trying VM: ${VM_NAME} in ${region} with size ${size}"
                                     bat """
                                     az vm create ^
                                       --resource-group ${RESOURCE_GROUP} ^
@@ -106,9 +107,8 @@ pipeline {
                                     """
                                     echo "VM created successfully in ${region} with size ${size}"
                                     vmCreated = true
-                                    break outer
                                 } catch (err) {
-                                    echo "Failed size ${size} in ${region}, trying next..."
+                                    echo "Failed to create size ${size} in ${region}, trying next..."
                                 }
                             }
                         }
@@ -135,7 +135,10 @@ pipeline {
         stage('Get Public IP') {
             steps {
                 script {
-                    def ip = bat(script: "az vm list-ip-addresses --name ${VM_NAME} --resource-group ${RESOURCE_GROUP} --query [0].virtualMachine.network.publicIpAddresses[0].ipAddress -o tsv", returnStdout: true).trim()
+                    def ip = bat(
+                        script: "az vm list-ip-addresses --name ${VM_NAME} --resource-group ${RESOURCE_GROUP} --query [0].virtualMachine.network.publicIpAddresses[0].ipAddress -o tsv",
+                        returnStdout: true
+                    ).trim()
                     echo "VM Public IP → ${ip}"
                 }
             }
