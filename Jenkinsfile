@@ -17,7 +17,7 @@ pipeline {
         string(
             name: 'AZURE_REGION',
             defaultValue: 'westeurope',
-            description: 'Azure region (example: westeurope, centralindia, westus)'
+            description: 'Preferred Azure region'
         )
 
         string(
@@ -29,7 +29,7 @@ pipeline {
         booleanParam(
             name: 'AUTO_CLEANUP',
             defaultValue: false,
-            description: 'Auto delete resource group after deployment (non-prod only)'
+            description: 'Auto delete resource group (non-prod only)'
         )
     }
 
@@ -44,7 +44,71 @@ pipeline {
             steps {
                 script {
                     echo "Environment = ${params.ENVIRONMENT}"
-                    echo "Region = ${params.AZURE_REGION}"
+                    echo "Requested Region = ${params.AZURE_REGION}"
+                }
+            }
+        }
+
+        /*
+        =========================================================
+        ENTERPRISE REGION SELECTION + FALLBACK + COST OPTIMIZATION
+        =========================================================
+        */
+        stage('Select Best Azure Region') {
+            steps {
+                script {
+
+                    def regionPriorityMap = [
+                        dev :  [params.AZURE_REGION, "centralindia", "eastus", "westus2", "westeurope"],
+                        test:  [params.AZURE_REGION, "centralindia", "westeurope", "eastus", "westus2"],
+                        prod:  [params.AZURE_REGION, "westeurope", "eastus2", "centralindia", "westus2"]
+                    ]
+
+                    def regionPriority = regionPriorityMap[params.ENVIRONMENT].unique()
+
+                    echo "Region priority order → ${regionPriority}"
+
+                    def selectedRegion = null
+
+                    for (r in regionPriority) {
+
+                        echo "Checking region → ${r}"
+
+                        def exists = bat(
+                            script: """
+                            az account list-locations ^
+                              --query "[?name=='${r}'].name" ^
+                              -o tsv
+                            """,
+                            returnStdout: true
+                        ).trim()
+
+                        if (exists) {
+                            echo "Region valid → ${r}"
+                            selectedRegion = r
+                            break
+                        }
+                    }
+
+                    if (!selectedRegion) {
+                        error("No valid Azure region available.")
+                    }
+
+                    env.ACTIVE_REGION = selectedRegion
+
+                    // DR standby region
+                    def drMap = [
+                        westeurope  : "northeurope",
+                        centralindia: "southindia",
+                        eastus      : "westus2",
+                        eastus2     : "centralus",
+                        westus2     : "eastus"
+                    ]
+
+                    env.DR_REGION = drMap[selectedRegion] ?: "eastus"
+
+                    echo "PRIMARY REGION → ${env.ACTIVE_REGION}"
+                    echo "DR STANDBY REGION → ${env.DR_REGION}"
                 }
             }
         }
@@ -70,7 +134,7 @@ pipeline {
 
                     script {
                         if (!env.ADMIN_PASS?.trim()) {
-                            error "VM admin password is empty. Check Jenkins credential mapping."
+                            error "VM admin password missing"
                         }
                     }
 
@@ -86,26 +150,23 @@ pipeline {
             }
         }
 
-        stage('Create or Validate Resource Group') {
+        stage('Create Resource Group') {
             steps {
-                echo "Creating resource group in ${params.AZURE_REGION}"
+                echo "Creating RG in ${env.ACTIVE_REGION}"
                 bat """
                 az group create ^
                   --name ${env.RESOURCE_GROUP} ^
-                  --location ${params.AZURE_REGION} ^
+                  --location ${env.ACTIVE_REGION} ^
                   --tags environment=${params.ENVIRONMENT} owner=jenkins
                 """
             }
         }
 
-        stage('Generate Unique Names') {
+        stage('Generate Names') {
             steps {
                 script {
                     env.STORAGE_NAME = "jenkinsstorage${UUID.randomUUID().toString().take(8)}".toLowerCase()
                     env.VM_NAME = "jenkins-${params.ENVIRONMENT}-win-${env.BUILD_NUMBER}"
-
-                    echo "Storage account = ${env.STORAGE_NAME}"
-                    echo "VM name = ${env.VM_NAME}"
                 }
             }
         }
@@ -117,7 +178,7 @@ pipeline {
                     az storage account create ^
                       --name ${env.STORAGE_NAME} ^
                       --resource-group ${env.RESOURCE_GROUP} ^
-                      --location ${params.AZURE_REGION} ^
+                      --location ${env.ACTIVE_REGION} ^
                       --sku Standard_LRS ^
                       --min-tls-version TLS1_2
                     """
@@ -125,62 +186,78 @@ pipeline {
             }
         }
 
-        stage('Create Windows VM') {
-    steps {
-        script {
+        /*
+        =========================================================
+        REGION + VM SIZE COMBINED FALLBACK (CAPACITY SAFE)
+        =========================================================
+        */
+        stage('Create Windows VM (Capacity Safe)') {
+            steps {
+                script {
 
-            def vmSizes = [
-                "Standard_B2s",
-                "Standard_DS1_v2",
-                "Standard_D2s_v5",
-                "Standard_B2ms",
-                "Standard_D4s_v5"
-            ]
+                    def regionOrder = [
+                        env.ACTIVE_REGION,
+                        env.DR_REGION
+                    ].unique()
 
-            def vmCreated = false
+                    def vmSizes = [
+                        "Standard_B2s",
+                        "Standard_DS1_v2",
+                        "Standard_D2s_v5",
+                        "Standard_B2ms",
+                        "Standard_D4s_v5"
+                    ]
 
-            for (size in vmSizes) {
+                    def created = false
 
-                if (vmCreated) break
+                    for (region in regionOrder) {
 
-                echo "------------------------------------"
-                echo "Trying VM size: ${size}"
-                echo "------------------------------------"
+                        if (created) break
 
-                try {
+                        echo "Trying region → ${region}"
 
-                    withCredentials([
-                        string(credentialsId: 'azure-vm-admin-password', variable: 'ADMIN_PASS')
-                    ]) {
+                        for (size in vmSizes) {
 
-                        bat """
-                        az vm create ^
-                          --resource-group rg-${params.ENVIRONMENT} ^
-                          --name ${env.VM_NAME} ^
-                          --image Win2019Datacenter ^
-                          --admin-username azureuser ^
-                          --admin-password "%ADMIN_PASS%" ^
-                          --size ${size} ^
-                          --location ${params.AZURE_REGION} ^
-                          --public-ip-sku Standard ^
-                          --tags environment=${params.ENVIRONMENT}
-                        """
+                            if (created) break
+
+                            echo "Trying size ${size} in ${region}"
+
+                            try {
+
+                                withCredentials([
+                                    string(credentialsId: 'azure-vm-admin-password', variable: 'ADMIN_PASS')
+                                ]) {
+
+                                    bat """
+                                    az vm create ^
+                                      --resource-group ${env.RESOURCE_GROUP} ^
+                                      --name ${env.VM_NAME} ^
+                                      --image Win2019Datacenter ^
+                                      --admin-username ${env.VM_ADMIN_USER} ^
+                                      --admin-password "%ADMIN_PASS%" ^
+                                      --size ${size} ^
+                                      --location ${region} ^
+                                      --public-ip-sku Standard ^
+                                      --tags environment=${params.ENVIRONMENT}
+                                    """
+                                }
+
+                                env.ACTIVE_REGION = region
+                                echo "VM CREATED → ${size} in ${region}"
+                                created = true
+
+                            } catch (err) {
+                                echo "FAILED → ${size} in ${region}"
+                            }
+                        }
                     }
 
-                    echo "SUCCESS → VM created using ${size}"
-                    vmCreated = true
-
-                } catch (err) {
-                    echo "FAILED → ${size} not available"
+                    if (!created) {
+                        error("VM creation failed across all regions and sizes.")
+                    }
                 }
             }
-
-            if (!vmCreated) {
-                error("No VM sizes available in this region. Try another region.")
-            }
         }
-    }
-}
 
         stage('Open RDP Port') {
             steps {
@@ -214,14 +291,13 @@ pipeline {
             }
         }
 
-        stage('Auto Cleanup (Non-Prod)') {
+        stage('Auto Cleanup') {
             when {
                 expression {
                     params.AUTO_CLEANUP && params.ENVIRONMENT != 'prod'
                 }
             }
             steps {
-                echo "Auto deleting resource group ${env.RESOURCE_GROUP}"
                 bat """
                 az group delete ^
                   --name ${env.RESOURCE_GROUP} ^
@@ -233,15 +309,11 @@ pipeline {
 
     post {
         always {
-            script {
-                bat 'az logout || exit 0'
-            }
+            bat 'az logout || exit 0'
         }
-
         success {
             echo 'Infrastructure deployment completed successfully'
         }
-
         failure {
             echo 'Infrastructure deployment failed'
         }
