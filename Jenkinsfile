@@ -7,9 +7,6 @@ pipeline {
         buildDiscarder(logRotator(numToKeepStr: '20'))
     }
 
-    ///////////////////////////////////////////////////////
-    // PARAMETERS
-    ///////////////////////////////////////////////////////
     parameters {
         choice(
             name: 'ENVIRONMENT',
@@ -23,47 +20,30 @@ pipeline {
             description: 'Preferred Azure region'
         )
 
-        string(
-            name: 'GIT_BRANCH',
-            defaultValue: 'main',
-            description: 'Git branch / release'
-        )
-
         booleanParam(
             name: 'AUTO_CLEANUP',
             defaultValue: false,
-            description: 'Delete resource group after deployment (non-prod only)'
+            description: 'Auto delete resource group after deployment (non-prod only)'
         )
     }
 
-    ///////////////////////////////////////////////////////
-    // ENVIRONMENT
-    ///////////////////////////////////////////////////////
     environment {
         RESOURCE_GROUP = "rg-${params.ENVIRONMENT}"
         VM_ADMIN_USER = "azureuser"
     }
 
-    ///////////////////////////////////////////////////////
-    // STAGES
-    ///////////////////////////////////////////////////////
     stages {
 
-        ///////////////////////////////////////////////////
-        // VALIDATE INPUTS
-        ///////////////////////////////////////////////////
         stage('Validate Inputs') {
             steps {
-                script {
-                    echo "Environment = ${params.ENVIRONMENT}"
-                    echo "Requested Region = ${params.AZURE_REGION}"
-                }
+                echo "Environment = ${params.ENVIRONMENT}"
+                echo "Requested Region = ${params.AZURE_REGION}"
             }
         }
 
-        ///////////////////////////////////////////////////
-        // AZURE LOGIN (REQUIRED FIRST)
-        ///////////////////////////////////////////////////
+        // =========================
+        // AZURE LOGIN FIRST
+        // =========================
         stage('Azure Login') {
             steps {
                 withCredentials([
@@ -76,7 +56,7 @@ pipeline {
 
                     script {
                         if (!env.ADMIN_PASS?.trim()) {
-                            error "VM admin password missing in Jenkins credentials"
+                            error "VM admin password is empty"
                         }
                     }
 
@@ -92,9 +72,9 @@ pipeline {
             }
         }
 
-        ///////////////////////////////////////////////////
-        // REGION FALLBACK SELECTION
-        ///////////////////////////////////////////////////
+        // =========================
+        // REGION FALLBACK LOGIC
+        // =========================
         stage('Select Best Azure Region') {
             steps {
                 script {
@@ -111,9 +91,6 @@ pipeline {
                     def selected = null
 
                     for (r in regionPriority) {
-
-                        echo "Checking region → ${r}"
-
                         def exists = bat(
                             script: """
                             az account list-locations ^
@@ -130,7 +107,7 @@ pipeline {
                     }
 
                     if (!selected) {
-                        error("No Azure regions available")
+                        error "No valid Azure region found"
                     }
 
                     env.SELECTED_REGION = selected
@@ -139,21 +116,13 @@ pipeline {
             }
         }
 
-        ///////////////////////////////////////////////////
-        // PROD APPROVAL
-        ///////////////////////////////////////////////////
         stage('Production Approval') {
-            when {
-                expression { params.ENVIRONMENT == 'prod' }
-            }
+            when { expression { params.ENVIRONMENT == 'prod' } }
             steps {
-                input message: 'Approve PRODUCTION deployment?', ok: 'Deploy'
+                input message: 'Approve production deployment?', ok: 'Deploy'
             }
         }
 
-        ///////////////////////////////////////////////////
-        // CREATE RESOURCE GROUP
-        ///////////////////////////////////////////////////
         stage('Create Resource Group') {
             steps {
                 bat """
@@ -165,47 +134,79 @@ pipeline {
             }
         }
 
-        ///////////////////////////////////////////////////
-        // GENERATE UNIQUE NAMES
-        ///////////////////////////////////////////////////
-        stage('Generate Names') {
+        // =========================
+        // ENTERPRISE STORAGE NAME GENERATOR
+        // =========================
+        stage('Generate Enterprise Resource Names') {
             steps {
                 script {
-                    env.STORAGE_NAME = "jenkins${UUID.randomUUID().toString().take(10)}".toLowerCase()
-                    env.VM_NAME = "jenkins-${params.ENVIRONMENT}-${env.BUILD_NUMBER}"
 
-                    echo "Storage = ${env.STORAGE_NAME}"
-                    echo "VM = ${env.VM_NAME}"
+                    def maxAttempts = 10
+                    def created = false
+
+                    for (int i=0; i<maxAttempts; i++) {
+
+                        def random = UUID.randomUUID()
+                            .toString()
+                            .replaceAll("-", "")
+                            .take(12)
+                            .toLowerCase()
+
+                        def envCode = params.ENVIRONMENT.take(3)
+                        def candidate = "st${envCode}${random}".take(24)
+
+                        def available = bat(
+                            script: """
+                            az storage account check-name ^
+                              --name ${candidate} ^
+                              --query nameAvailable ^
+                              -o tsv
+                            """,
+                            returnStdout: true
+                        ).trim()
+
+                        if (available == "true") {
+                            env.STORAGE_NAME = candidate
+                            created = true
+                            break
+                        }
+
+                        echo "Storage name ${candidate} not available → retrying"
+                    }
+
+                    if (!created) {
+                        error "Failed to generate unique storage account name"
+                    }
+
+                    env.VM_NAME = "vm-${params.ENVIRONMENT}-${env.BUILD_NUMBER}"
+
+                    echo "Final Storage Name = ${env.STORAGE_NAME}"
+                    echo "VM Name = ${env.VM_NAME}"
                 }
             }
         }
 
-        ///////////////////////////////////////////////////
-        // CREATE STORAGE ACCOUNT
-        ///////////////////////////////////////////////////
         stage('Create Storage Account') {
             steps {
-                retry(2) {
-                    bat """
-                    az storage account create ^
-                      --name ${env.STORAGE_NAME} ^
-                      --resource-group ${env.RESOURCE_GROUP} ^
-                      --location ${env.SELECTED_REGION} ^
-                      --sku Standard_LRS ^
-                      --min-tls-version TLS1_2
-                    """
-                }
+                bat """
+                az storage account create ^
+                  --name ${env.STORAGE_NAME} ^
+                  --resource-group ${env.RESOURCE_GROUP} ^
+                  --location ${env.SELECTED_REGION} ^
+                  --sku Standard_LRS ^
+                  --min-tls-version TLS1_2
+                """
             }
         }
 
-        ///////////////////////////////////////////////////
-        // CREATE WINDOWS VM (SIZE FALLBACK)
-        ///////////////////////////////////////////////////
-        stage('Create Windows VM') {
+        // =========================
+        // VM CAPACITY SAFE CREATION
+        // =========================
+        stage('Create Windows VM (Capacity Safe)') {
             steps {
                 script {
 
-                    def vmSizes = [
+                    def sizes = [
                         "Standard_B2s",
                         "Standard_DS1_v2",
                         "Standard_D2s_v5",
@@ -215,16 +216,15 @@ pipeline {
 
                     def created = false
 
-                    for (size in vmSizes) {
-
+                    for (s in sizes) {
                         if (created) break
 
-                        echo "Trying VM size → ${size}"
-
                         try {
+
                             withCredentials([
                                 string(credentialsId: 'azure-vm-admin-password', variable: 'ADMIN_PASS')
                             ]) {
+
                                 bat """
                                 az vm create ^
                                   --resource-group ${env.RESOURCE_GROUP} ^
@@ -232,31 +232,27 @@ pipeline {
                                   --image Win2019Datacenter ^
                                   --admin-username ${env.VM_ADMIN_USER} ^
                                   --admin-password "%ADMIN_PASS%" ^
-                                  --size ${size} ^
+                                  --size ${s} ^
                                   --location ${env.SELECTED_REGION} ^
-                                  --public-ip-sku Standard ^
-                                  --tags environment=${params.ENVIRONMENT}
+                                  --public-ip-sku Standard
                                 """
                             }
 
-                            echo "VM created using ${size}"
+                            echo "VM created with size ${s}"
                             created = true
 
-                        } catch (err) {
-                            echo "Size unavailable → ${size}"
+                        } catch (e) {
+                            echo "Size ${s} unavailable → trying next"
                         }
                     }
 
                     if (!created) {
-                        error("No VM sizes available in ${env.SELECTED_REGION}")
+                        error "No VM sizes available in region"
                     }
                 }
             }
         }
 
-        ///////////////////////////////////////////////////
-        // OPEN RDP
-        ///////////////////////////////////////////////////
         stage('Open RDP Port') {
             steps {
                 bat """
@@ -268,9 +264,6 @@ pipeline {
             }
         }
 
-        ///////////////////////////////////////////////////
-        // GET PUBLIC IP
-        ///////////////////////////////////////////////////
         stage('Get VM Public IP') {
             steps {
                 script {
@@ -286,15 +279,12 @@ pipeline {
                         returnStdout: true
                     ).trim()
 
-                    echo "VM PUBLIC IP → ${ip}"
+                    echo "VM PUBLIC IP = ${ip}"
                     echo "RDP → mstsc /v:${ip}"
                 }
             }
         }
 
-        ///////////////////////////////////////////////////
-        // AUTO CLEANUP
-        ///////////////////////////////////////////////////
         stage('Auto Cleanup') {
             when {
                 expression {
@@ -311,20 +301,15 @@ pipeline {
         }
     }
 
-    ///////////////////////////////////////////////////////
-    // POST
-    ///////////////////////////////////////////////////////
     post {
         always {
             script {
                 bat 'az logout || exit 0'
             }
         }
-
         success {
             echo 'Infrastructure deployment completed successfully'
         }
-
         failure {
             echo 'Infrastructure deployment failed'
         }
