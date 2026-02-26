@@ -22,9 +22,7 @@ pipeline {
     stages {
 
         stage('Checkout SCM') {
-            steps {
-                checkout scm
-            }
+            steps { checkout scm }
         }
 
         stage('Azure Login') {
@@ -59,7 +57,8 @@ pipeline {
         stage('Generate Names') {
             steps {
                 script {
-                    def timestamp = System.currentTimeMillis().toString().takeRight(8)
+                    // Safe last 8 digits timestamp
+                    def timestamp = (System.currentTimeMillis() % 100_000_000).toString()
                     STORAGE_NAME = "${STORAGE_PREFIX}${timestamp}"
                     VM_NAME = "${VM_PREFIX}${timestamp}"
                     echo "Storage → ${STORAGE_NAME}"
@@ -144,20 +143,14 @@ pipeline {
             }
         }
 
-    } // stages
+    }
 
     post {
         always {
             echo "Logging out from Azure"
             bat "az logout || exit 0"
         }
-
-        failure {
-            echo "Deployment failed!"
-        }
-
-        success {
-            echo "Deployment completed successfully!"
-        }
+        failure { echo "Deployment failed!" }
+        success { echo "Deployment completed successfully!" }
     }
 }
